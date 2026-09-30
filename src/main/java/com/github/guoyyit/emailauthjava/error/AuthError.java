@@ -1,0 +1,13 @@
+package com.github.guoyyit.emailauthjava.error;
+
+public enum AuthError {
+    MESSAGE_TOO_LARGE,
+    HEADER_TOO_LARGE,
+    HEADER_LINE_TOO_LONG,
+    TOO_MANY_HEADERS,
+    DNS_RESPONSE_TOO_LARGE,
+    INCLUDE_DEPTH_EXCEEDED,
+    DNS_QUERY_LIMIT_EXCEEDED,
+    TOO_MANY_SIGNATURES,
+    MALFORMED_HEADER
+}
