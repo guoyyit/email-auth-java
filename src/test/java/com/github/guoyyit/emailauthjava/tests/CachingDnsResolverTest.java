@@ -59,6 +59,174 @@ class CachingDnsResolverTest {
     }
 
     @Test
+    void eachRecordUsesItsOwnTtlAndRefetchesAfterExpiry() throws Exception {
+        AuthProperties properties = new AuthProperties();
+        MapBackedDnsResolver backend = new MapBackedDnsResolver(new HashMap<>());
+        AtomicInteger calls = new AtomicInteger();
+        backend.putWithTtl("fast.example", RecordType.TXT, List.of("v=spf1 -all"), 1L);
+        backend.putWithTtl("slow.example", RecordType.TXT, List.of("v=spf1 -all"), 30L);
+        CachingDnsResolver caching = new CachingDnsResolver(new MapBackedDnsResolver(
+                new HashMap<>()) {
+            @Override
+            public DnsResult resolve(String domain, RecordType type) {
+                calls.incrementAndGet();
+                return backend.resolve(domain, type);
+            }
+            @Override
+            public DnsResult resolveAt(String domain, RecordType type, long version) {
+                calls.incrementAndGet();
+                return backend.resolveAt(domain, type, version);
+            }
+        }, properties);
+
+        assertThat(caching.resolve("fast.example", RecordType.TXT).getStatus()).isEqualTo(DnsStatus.OK);
+        assertThat(caching.resolve("slow.example", RecordType.TXT).getStatus()).isEqualTo(DnsStatus.OK);
+        assertThat(calls).hasValue(2);
+
+        caching.resolve("fast.example", RecordType.TXT);
+        caching.resolve("slow.example", RecordType.TXT);
+        assertThat(calls).hasValue(2);
+
+        Thread.sleep(1200);
+        // fast（TTL 1s）必须重新解析；slow（TTL 30s）仍命中自己的缓存。
+        caching.resolve("fast.example", RecordType.TXT);
+        caching.resolve("slow.example", RecordType.TXT);
+        assertThat(calls).hasValue(3);
+    }
+
+    @Test
+    void zeroTtlRecordIsNeverCached() {
+        AuthProperties properties = new AuthProperties();
+        AtomicInteger calls = new AtomicInteger();
+        MapBackedDnsResolver backend = new MapBackedDnsResolver(new HashMap<>()) {
+            @Override
+            public DnsResult resolve(String domain, RecordType type) {
+                calls.incrementAndGet();
+                return super.resolve(domain, type);
+            }
+            @Override
+            public DnsResult resolveAt(String domain, RecordType type, long version) {
+                calls.incrementAndGet();
+                return super.resolveAt(domain, type, version);
+            }
+        };
+        backend.putWithTtl("volatile.example", RecordType.TXT,
+                List.of("v=spf1 -all"), 0L);
+        CachingDnsResolver caching = new CachingDnsResolver(backend, properties);
+        caching.resolve("volatile.example", RecordType.TXT);
+        caching.resolve("volatile.example", RecordType.TXT);
+        assertThat(calls).hasValue(2);
+    }
+
+    @Test
+    void failureCategoriesHaveIndependentSpacesAndTtls() throws Exception {
+        AuthProperties properties = new AuthProperties();
+        properties.getDns().setNxdomainCacheTtlSeconds(1L);
+        properties.getDns().setTimeoutCacheTtlSeconds(30L);
+        properties.getDns().setMalformedCacheTtlSeconds(30L);
+        AtomicInteger nxCalls = new AtomicInteger();
+        AtomicInteger timeoutCalls = new AtomicInteger();
+        AtomicInteger malformedCalls = new AtomicInteger();
+        MapBackedDnsResolver backend = new MapBackedDnsResolver(new HashMap<>()) {
+            @Override
+            public DnsResult resolve(String domain, RecordType type) {
+                switch (domain) {
+                    case "nx.example":
+                        nxCalls.incrementAndGet();
+                        return new DnsResult(DnsStatus.NXDOMAIN, List.of(), List.of());
+                    case "to.example":
+                        timeoutCalls.incrementAndGet();
+                        return new DnsResult(DnsStatus.TIMEOUT, List.of(), List.of());
+                    default:
+                        malformedCalls.incrementAndGet();
+                        return new DnsResult(DnsStatus.MALFORMED, List.of(), List.of());
+                }
+            }
+            @Override
+            public DnsResult resolveAt(String domain, RecordType type, long version) {
+                return resolve(domain, type);
+            }
+        };
+        CachingDnsResolver caching = new CachingDnsResolver(backend, properties);
+
+        caching.resolve("nx.example", RecordType.TXT);
+        caching.resolve("to.example", RecordType.TXT);
+        caching.resolve("mf.example", RecordType.TXT);
+        caching.resolve("nx.example", RecordType.TXT);
+        caching.resolve("to.example", RecordType.TXT);
+        caching.resolve("mf.example", RecordType.TXT);
+        assertThat(nxCalls).hasValue(1);
+        assertThat(timeoutCalls).hasValue(1);
+        assertThat(malformedCalls).hasValue(1);
+
+        Thread.sleep(1200);
+        // NXDOMAIN（1s）到期重查；TIMEOUT/MALFORMED（30s）各自命中不受影响。
+        caching.resolve("nx.example", RecordType.TXT);
+        caching.resolve("to.example", RecordType.TXT);
+        caching.resolve("mf.example", RecordType.TXT);
+        assertThat(nxCalls).hasValue(2);
+        assertThat(timeoutCalls).hasValue(1);
+        assertThat(malformedCalls).hasValue(1);
+    }
+
+    @Test
+    void failureCategoryChangeDoesNotReuseOtherSpace() throws Exception {
+        AuthProperties properties = new AuthProperties();
+        properties.getDns().setTimeoutCacheTtlSeconds(1L);
+        java.util.concurrent.atomic.AtomicBoolean timedOut =
+                new java.util.concurrent.atomic.AtomicBoolean(true);
+        AtomicInteger calls = new AtomicInteger();
+        MapBackedDnsResolver timed = new MapBackedDnsResolver(new HashMap<>()) {
+            @Override
+            public DnsResult resolve(String domain, RecordType type) {
+                calls.incrementAndGet();
+                return timedOut.get()
+                        ? new DnsResult(DnsStatus.TIMEOUT, List.of(), List.of())
+                        : new DnsResult(DnsStatus.OK, List.of("v=spf1 -all"), List.of(), 30L);
+            }
+            @Override
+            public DnsResult resolveAt(String domain, RecordType type, long version) {
+                return resolve(domain, type);
+            }
+        };
+        CachingDnsResolver caching = new CachingDnsResolver(timed, properties);
+        assertThat(caching.resolve("flip.example", RecordType.TXT).getStatus())
+                .isEqualTo(DnsStatus.TIMEOUT);
+        int afterFirst = calls.get();
+        Thread.sleep(1200);
+        timedOut.set(false);
+        // TIMEOUT 空间过期后重新解析得到 OK：立即生效，之后命中新的 OK 空间，
+        // 不沿用 TIMEOUT 空间的过期时间。
+        assertThat(caching.resolve("flip.example", RecordType.TXT).getStatus())
+                .isEqualTo(DnsStatus.OK);
+        assertThat(caching.resolve("flip.example", RecordType.TXT).getStatus())
+                .isEqualTo(DnsStatus.OK);
+        assertThat(calls.get()).isEqualTo(afterFirst + 1);
+    }
+
+    @Test
+    void zeroTtlFailureIsNotCached() {
+        AuthProperties properties = new AuthProperties();
+        properties.getDns().setTimeoutCacheTtlSeconds(0L);
+        AtomicInteger calls = new AtomicInteger();
+        MapBackedDnsResolver backend = new MapBackedDnsResolver(new HashMap<>()) {
+            @Override
+            public DnsResult resolve(String domain, RecordType type) {
+                calls.incrementAndGet();
+                return new DnsResult(DnsStatus.TIMEOUT, List.of(), List.of());
+            }
+            @Override
+            public DnsResult resolveAt(String domain, RecordType type, long version) {
+                return resolve(domain, type);
+            }
+        };
+        CachingDnsResolver caching = new CachingDnsResolver(backend, properties);
+        caching.resolve("nocache.example", RecordType.TXT);
+        caching.resolve("nocache.example", RecordType.TXT);
+        assertThat(calls).hasValue(2);
+    }
+
+    @Test
     void concurrentResolutionHappensOnce() throws Exception {
         AtomicInteger calls = new AtomicInteger();
         CountDownLatch inside = new CountDownLatch(1);
@@ -72,6 +240,7 @@ class CachingDnsResolverTest {
                     release.await(2, TimeUnit.SECONDS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    return new DnsResult(DnsStatus.TIMEOUT, List.of(), List.of());
                 }
                 return new DnsResult(DnsStatus.OK, List.of("v=spf1 -all"), List.of());
             }

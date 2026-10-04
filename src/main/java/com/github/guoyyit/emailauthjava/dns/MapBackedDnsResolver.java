@@ -32,6 +32,20 @@ public class MapBackedDnsResolver implements VersionedDnsResolver {
         put(domain, type, new DnsResult(status, records, exchanges));
     }
 
+    /**
+     * 放入带自身 TTL 的 OK 记录（同域同类型的多值记录整体共享该 TTL）。
+     * TTL 为 0 表示调用方要求该结果不被缓存。
+     */
+    public void putWithTtl(String domain, RecordType type, java.util.List<String> records,
+                           long ttlSeconds) {
+        put(domain, type, new DnsResult(DnsStatus.OK, records, java.util.List.of(), ttlSeconds));
+    }
+
+    public void putWithTtl(String domain, RecordType type, java.util.List<String> records,
+                           java.util.List<String> exchanges, long ttlSeconds) {
+        put(domain, type, new DnsResult(DnsStatus.OK, records, exchanges, ttlSeconds));
+    }
+
     public void replaceAll(Map<String, DnsResult> nextRecords) {
         Zone zone = new Zone(new ConcurrentHashMap<>(nextRecords),
                 versionSequence.incrementAndGet());

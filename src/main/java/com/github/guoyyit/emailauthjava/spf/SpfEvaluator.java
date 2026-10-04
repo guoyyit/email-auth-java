@@ -241,7 +241,41 @@ public class SpfEvaluator {
                     "more than " + MAX_MX_HOSTS + " MX hosts for " + target);
         }
         for (String exchange : mx.getExchangeNames()) {
-            if (matchesHostRecord(term, exchange, context)) {
+            if (matchesExchangeAddresses(term, exchange, context)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 以 MX 交换主机名查询其 A/AAAA 记录并与客户端 IP 比对。
+     * 目标固定为交换主机本身，绝不回退到 mx 机制参数域；
+     * CIDR 前缀仍取自 mx 机制上的 /cidr 或 //cidr。
+     */
+    private boolean matchesExchangeAddresses(Term term, String exchange, Context context) {
+        String target = normalize(exchange);
+        if (!isValidDomain(target)) {
+            throw new DnsFailureException(SpfStatus.PERMERROR,
+                    "invalid MX exchange " + exchange);
+        }
+        RecordType type = context.clientIsV6 ? RecordType.AAAA : RecordType.A;
+        DnsResult result = query(target, type, context);
+        if (result.getStatus() != DnsStatus.OK) {
+            if (result.getStatus() == DnsStatus.TIMEOUT) {
+                throw new DnsFailureException(SpfStatus.TEMPERROR,
+                        type + " lookup timeout for MX exchange " + target);
+            }
+            return false;
+        }
+        int prefix = context.clientIsV6
+                ? (term.ip6Cidr == null ? 128 : term.ip6Cidr)
+                : (term.ip4Cidr == null ? 32 : term.ip4Cidr);
+        for (String address : result.getRecords()) {
+            byte[] candidate = context.clientIsV6
+                    ? IpAddresses.parseIpv6(address) : IpAddresses.parseIpv4(address);
+            if (candidate != null
+                    && IpAddresses.prefixMatch(context.clientBytes, candidate, prefix)) {
                 return true;
             }
         }

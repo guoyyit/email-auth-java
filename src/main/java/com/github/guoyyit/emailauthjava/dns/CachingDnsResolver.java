@@ -8,12 +8,16 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class CachingDnsResolver implements DnsResolver {
-    private static final long NEGATIVE_TTL_SECONDS = 60L;
-    private static final long TIMEOUT_TTL_SECONDS = 5L;
-
     private final DnsResolver delegate;
     private final AuthProperties properties;
+    // 缓存键含结果类别（OK/NXDOMAIN/TIMEOUT/MALFORMED）：三类失败与 OK 分属
+    // 相互独立的缓存空间，任一类的命中、更新或过期都不影响其它类别。
     private final ConcurrentHashMap<String, CacheEntry> cache = new ConcurrentHashMap<>();
+    // 每个“版本 + 域 + 类型”当前指向的结果类别；指向为空表示未缓存或已过期。
+    private final ConcurrentHashMap<String, DnsStatus> categoryPointers =
+            new ConcurrentHashMap<>();
+    // 以“版本 + 域 + 类型”为粒度的单飞锁。
+    private final ConcurrentHashMap<String, Object> flightLocks = new ConcurrentHashMap<>();
 
     public CachingDnsResolver(DnsResolver delegate, AuthProperties properties) {
         this.delegate = delegate;
@@ -36,6 +40,7 @@ public class CachingDnsResolver implements DnsResolver {
 
     public void invalidate() {
         cache.clear();
+        categoryPointers.clear();
     }
 
     private long currentVersion() {
@@ -43,24 +48,59 @@ public class CachingDnsResolver implements DnsResolver {
     }
 
     DnsResult resolveForVersion(String domain, RecordType type, long version) {
-        String key = MapBackedDnsResolver.key(domain, type);
+        String baseKey = version + "|" + MapBackedDnsResolver.key(domain, type);
         long now = System.currentTimeMillis();
-        CacheEntry cached = cache.get(key);
-        if (cached != null && cached.version == version && cached.expiresAtMillis > now) {
-            return cached.result;
-        }
-        // 以键为粒度的单飞（single-flight）：并发求值只产生一次底层解析。
-        CacheEntry fetched = cache.compute(key, (k, existing) -> {
-            if (existing != null && existing.version == version
-                    && existing.expiresAtMillis > System.currentTimeMillis()) {
-                return existing;
+        DnsStatus category = categoryPointers.get(baseKey);
+        if (category != null) {
+            CacheEntry cached = cache.get(entryKey(baseKey, category));
+            if (cached != null && cached.expiresAtMillis > now) {
+                return cached.result;
             }
-            DnsResult result = queryDelegate(domain, type, version);
-            checkSize(domain, type, result);
-            long ttlSeconds = ttlFor(result);
-            return new CacheEntry(result, version, System.currentTimeMillis() + ttlSeconds * 1000L);
-        });
-        return fetched.result;
+        }
+        // 以“版本 + 键”为粒度的单飞（single-flight）：并发求值只产生一次底层解析。
+        Object lock = flightLocks.computeIfAbsent(baseKey, k -> new Object());
+        try {
+            synchronized (lock) {
+                DnsStatus current = categoryPointers.get(baseKey);
+                if (current != null) {
+                    CacheEntry cached = cache.get(entryKey(baseKey, current));
+                    if (cached != null && cached.expiresAtMillis > System.currentTimeMillis()) {
+                        return cached.result;
+                    }
+                }
+                DnsResult result = queryDelegate(domain, type, version);
+                checkSize(domain, type, result);
+                long ttlSeconds = ttlFor(result);
+                publish(baseKey, result, ttlSeconds);
+                return result;
+            }
+        } finally {
+            flightLocks.remove(baseKey, lock);
+        }
+    }
+
+    private void publish(String baseKey, DnsResult result, long ttlSeconds) {
+        DnsStatus newCategory = result.getStatus() == DnsStatus.OK ? DnsStatus.OK
+                : result.getStatus();
+        if (ttlSeconds <= 0) {
+            // TTL 为 0：不写入缓存，并清掉该键此前指向的任何类别空间。
+            categoryPointers.remove(baseKey);
+            for (DnsStatus status : DnsStatus.values()) {
+                cache.remove(entryKey(baseKey, status));
+            }
+            return;
+        }
+        DnsStatus previous = categoryPointers.put(baseKey, newCategory);
+        if (previous != null && previous != newCategory) {
+            // 结果类别切换：旧类别空间立即失效，两类空间互不沿用过期时间。
+            cache.remove(entryKey(baseKey, previous));
+        }
+        cache.put(entryKey(baseKey, newCategory),
+                new CacheEntry(result, System.currentTimeMillis() + ttlSeconds * 1000L));
+    }
+
+    private static String entryKey(String baseKey, DnsStatus category) {
+        return baseKey + "|" + category.name();
     }
 
     private DnsResult queryDelegate(String domain, RecordType type, long wantedVersion) {
@@ -71,13 +111,21 @@ public class CachingDnsResolver implements DnsResolver {
     }
 
     private long ttlFor(DnsResult result) {
-        long configured = properties.getDns().getCacheTtlSeconds();
-        return switch (result.getStatus()) {
-            case OK -> configured;
-            // 三类失败结果彼此独立缓存；TIMEOUT 使用极短 TTL，兼顾并发去重与快速故障恢复。
-            case TIMEOUT -> Math.min(TIMEOUT_TTL_SECONDS, configured);
-            default -> Math.min(NEGATIVE_TTL_SECONDS, configured);
-        };
+        AuthProperties.Dns dns = properties.getDns();
+        if (result.getStatus() != DnsStatus.OK) {
+            return switch (result.getStatus()) {
+                case NXDOMAIN -> dns.getNxdomainCacheTtlSeconds();
+                case TIMEOUT -> dns.getTimeoutCacheTtlSeconds();
+                case MALFORMED -> dns.getMalformedCacheTtlSeconds();
+                default -> 0;
+            };
+        }
+        // OK 结果的过期时间来自记录自身的 TTL；底层未提供时套用配置默认值。
+        Long recordTtl = result.getTtlSeconds();
+        if (recordTtl == null || recordTtl < 0) {
+            return dns.getCacheTtlSeconds();
+        }
+        return recordTtl;
     }
 
     private void checkSize(String domain, RecordType type, DnsResult result) {
@@ -99,7 +147,7 @@ public class CachingDnsResolver implements DnsResolver {
         }
     }
 
-    private record CacheEntry(DnsResult result, long version, long expiresAtMillis) {
+    private record CacheEntry(DnsResult result, long expiresAtMillis) {
     }
 
     private static final class SessionResolver implements DnsResolver {

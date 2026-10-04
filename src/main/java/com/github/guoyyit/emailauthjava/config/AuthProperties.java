@@ -45,11 +45,21 @@ public class AuthProperties {
     public static class Dns {
         private long timeoutMillis = 3000;
         private long cacheTtlSeconds = 300;
+        // 三类失败结果各自独立的缓存时长（秒）；配置为 0 时对应失败结果不缓存。
+        private long nxdomainCacheTtlSeconds = 60;
+        private long timeoutCacheTtlSeconds = 5;
+        private long malformedCacheTtlSeconds = 60;
 
         public long getTimeoutMillis() { return timeoutMillis; }
         public void setTimeoutMillis(long v) { this.timeoutMillis = v; }
         public long getCacheTtlSeconds() { return cacheTtlSeconds; }
         public void setCacheTtlSeconds(long v) { this.cacheTtlSeconds = v; }
+        public long getNxdomainCacheTtlSeconds() { return nxdomainCacheTtlSeconds; }
+        public void setNxdomainCacheTtlSeconds(long v) { this.nxdomainCacheTtlSeconds = v; }
+        public long getTimeoutCacheTtlSeconds() { return timeoutCacheTtlSeconds; }
+        public void setTimeoutCacheTtlSeconds(long v) { this.timeoutCacheTtlSeconds = v; }
+        public long getMalformedCacheTtlSeconds() { return malformedCacheTtlSeconds; }
+        public void setMalformedCacheTtlSeconds(long v) { this.malformedCacheTtlSeconds = v; }
     }
 
     public static class Report {
