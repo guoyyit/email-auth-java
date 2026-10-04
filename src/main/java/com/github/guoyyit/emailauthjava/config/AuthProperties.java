@@ -44,12 +44,23 @@ public class AuthProperties {
 
     public static class Dns {
         private long timeoutMillis = 3000;
+        // 成功结果未自带 TTL 时回退使用的缓存时长。
         private long cacheTtlSeconds = 300;
+        // 三类失败结果使用相互独立的缓存空间，TTL 各自可配；0 表示不缓存该类失败。
+        private long nxdomainTtlSeconds = 60;
+        private long malformedTtlSeconds = 60;
+        private long timeoutTtlSeconds = 5;
 
         public long getTimeoutMillis() { return timeoutMillis; }
         public void setTimeoutMillis(long v) { this.timeoutMillis = v; }
         public long getCacheTtlSeconds() { return cacheTtlSeconds; }
         public void setCacheTtlSeconds(long v) { this.cacheTtlSeconds = v; }
+        public long getNxdomainTtlSeconds() { return nxdomainTtlSeconds; }
+        public void setNxdomainTtlSeconds(long v) { this.nxdomainTtlSeconds = v; }
+        public long getMalformedTtlSeconds() { return malformedTtlSeconds; }
+        public void setMalformedTtlSeconds(long v) { this.malformedTtlSeconds = v; }
+        public long getTimeoutTtlSeconds() { return timeoutTtlSeconds; }
+        public void setTimeoutTtlSeconds(long v) { this.timeoutTtlSeconds = v; }
     }
 
     public static class Report {

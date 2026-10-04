@@ -32,6 +32,12 @@ public class MapBackedDnsResolver implements VersionedDnsResolver {
         put(domain, type, new DnsResult(status, records, exchanges));
     }
 
+    public void put(String domain, RecordType type, DnsStatus status,
+                    java.util.List<String> records, java.util.List<String> exchanges,
+                    long ttlSeconds) {
+        put(domain, type, new DnsResult(status, records, exchanges, ttlSeconds));
+    }
+
     public void replaceAll(Map<String, DnsResult> nextRecords) {
         Zone zone = new Zone(new ConcurrentHashMap<>(nextRecords),
                 versionSequence.incrementAndGet());

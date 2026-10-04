@@ -201,6 +201,36 @@ public class SpfEvaluator {
 
     private boolean matchesHostRecord(Term term, String currentDomain, Context context) {
         String target = term.argument != null ? term.argument : currentDomain;
+        return matchesAddressRecords(term, target, context);
+    }
+
+    private boolean matchesMx(Term term, String currentDomain, Context context) {
+        String target = term.argument != null ? term.argument : currentDomain;
+        if (!isValidDomain(target)) {
+            throw new DnsFailureException(SpfStatus.PERMERROR, "invalid domain " + target);
+        }
+        DnsResult mx = query(target, RecordType.MX, context);
+        if (mx.getStatus() != DnsStatus.OK) {
+            if (mx.getStatus() == DnsStatus.TIMEOUT) {
+                throw new DnsFailureException(SpfStatus.TEMPERROR, "MX timeout for " + target);
+            }
+            return false;
+        }
+        if (mx.getExchangeNames().size() > MAX_MX_HOSTS) {
+            throw new DnsFailureException(SpfStatus.PERMERROR,
+                    "more than " + MAX_MX_HOSTS + " MX hosts for " + target);
+        }
+        // mx 的参数域只用于查询 MX 记录；地址比对必须针对 MX 应答中的交换主机名，
+        // 不能把参数域自身的 A/AAAA 记录当作交换主机地址。
+        for (String exchange : mx.getExchangeNames()) {
+            if (matchesAddressRecords(term, exchange, context)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean matchesAddressRecords(Term term, String target, Context context) {
         if (!isValidDomain(target)) {
             throw new DnsFailureException(SpfStatus.PERMERROR, "invalid domain " + target);
         }
@@ -221,27 +251,6 @@ public class SpfEvaluator {
                     ? IpAddresses.parseIpv6(address) : IpAddresses.parseIpv4(address);
             if (candidate != null
                     && IpAddresses.prefixMatch(context.clientBytes, candidate, prefix)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean matchesMx(Term term, String currentDomain, Context context) {
-        String target = term.argument != null ? term.argument : currentDomain;
-        DnsResult mx = query(target, RecordType.MX, context);
-        if (mx.getStatus() != DnsStatus.OK) {
-            if (mx.getStatus() == DnsStatus.TIMEOUT) {
-                throw new DnsFailureException(SpfStatus.TEMPERROR, "MX timeout for " + target);
-            }
-            return false;
-        }
-        if (mx.getExchangeNames().size() > MAX_MX_HOSTS) {
-            throw new DnsFailureException(SpfStatus.PERMERROR,
-                    "more than " + MAX_MX_HOSTS + " MX hosts for " + target);
-        }
-        for (String exchange : mx.getExchangeNames()) {
-            if (matchesHostRecord(term, exchange, context)) {
                 return true;
             }
         }

@@ -1,6 +1,7 @@
 package com.github.guoyyit.emailauthjava.tests;
 
 import com.github.guoyyit.emailauthjava.config.AuthProperties;
+import com.github.guoyyit.emailauthjava.dns.CachingDnsResolver;
 import com.github.guoyyit.emailauthjava.dns.DnsResult;
 import com.github.guoyyit.emailauthjava.dns.DnsStatus;
 import com.github.guoyyit.emailauthjava.dns.MapBackedDnsResolver;
@@ -74,6 +75,103 @@ class SpfEvaluatorTest {
     }
 
     @Test
+    void mxWithDomainArgMatchesExchangeHostsOnly() {
+        dns.put("example.com", RecordType.TXT, DnsStatus.OK,
+                List.of("v=spf1 mx:relay.example.net -all"));
+        dns.put("relay.example.net", RecordType.MX, DnsStatus.OK,
+                List.of(), List.of("mxa.relay.example.net", "mxb.relay.example.net"));
+        dns.put("mxa.relay.example.net", RecordType.A, DnsStatus.OK,
+                List.of("192.0.2.70"));
+        dns.put("mxb.relay.example.net", RecordType.A, DnsStatus.OK,
+                List.of("192.0.2.71"));
+        // 参数域自身的 A 记录不是交换主机地址，不得通过。
+        dns.put("relay.example.net", RecordType.A, DnsStatus.OK,
+                List.of("203.0.113.99"));
+
+        assertThat(evaluator.evaluate("h", "192.0.2.70", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.PASS);
+        assertThat(evaluator.evaluate("h", "192.0.2.71", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.PASS);
+        assertThat(evaluator.evaluate("h", "203.0.113.99", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.FAIL);
+        assertThat(evaluator.evaluate("h", "198.51.100.5", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.FAIL);
+    }
+
+    @Test
+    void mxWithDomainArgHonoursQualifierAndCidr() {
+        dns.put("example.com", RecordType.TXT, DnsStatus.OK,
+                List.of("v=spf1 ~mx:relay.example.net/24 ?all"));
+        dns.put("relay.example.net", RecordType.MX, DnsStatus.OK,
+                List.of(), List.of("m.relay.example.net"));
+        dns.put("m.relay.example.net", RecordType.A, DnsStatus.OK,
+                List.of("192.0.2.70"));
+
+        assertThat(evaluator.evaluate("h", "192.0.2.200", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.SOFTFAIL);
+    }
+
+    @Test
+    void mxWithoutArgUsesCurrentDomainExchanges() {
+        dns.put("example.com", RecordType.TXT, DnsStatus.OK,
+                List.of("v=spf1 mx -all"));
+        dns.put("example.com", RecordType.MX, DnsStatus.OK,
+                List.of(), List.of("mx1.example.com", "mx2.example.com"));
+        dns.put("mx1.example.com", RecordType.A, DnsStatus.OK, List.of("192.0.2.80"));
+        dns.put("mx2.example.com", RecordType.A, DnsStatus.OK, List.of("192.0.2.81"));
+
+        assertThat(evaluator.evaluate("h", "192.0.2.80", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.PASS);
+        // 交换主机没有 AAAA 记录，IPv6 客户端不匹配。
+        assertThat(evaluator.evaluate("h", "2001:db8::80", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.FAIL);
+        assertThat(evaluator.evaluate("h", "10.0.0.1", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.FAIL);
+    }
+
+    @Test
+    void mxWithDomainArgUsesAaaaForV6Clients() {
+        dns.put("example.com", RecordType.TXT, DnsStatus.OK,
+                List.of("v=spf1 mx:relay.example.net -all"));
+        dns.put("relay.example.net", RecordType.MX, DnsStatus.OK,
+                List.of(), List.of("v6.relay.example.net"));
+        dns.put("v6.relay.example.net", RecordType.AAAA, DnsStatus.OK,
+                List.of("2001:db8:1::1"));
+        // 交换主机仅有 IPv6 地址，IPv4 客户端不应通过。
+        assertThat(evaluator.evaluate("h", "2001:db8:1::1", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.PASS);
+        assertThat(evaluator.evaluate("h", "192.0.2.90", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.FAIL);
+    }
+
+    @Test
+    void mxWithDomainArgFailuresKeepExistingMapping() {
+        dns.put("example.com", RecordType.TXT, DnsStatus.OK,
+                List.of("v=spf1 mx:relay.example.net -all"));
+        dns.put("relay.example.net", RecordType.MX, DnsStatus.NXDOMAIN, List.of());
+        // MX 查询 NXDOMAIN：该机制不匹配，落到 -all。
+        assertThat(evaluator.evaluate("h", "192.0.2.1", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.FAIL);
+
+        dns.put("example.com", RecordType.TXT, DnsStatus.OK,
+                List.of("v=spf1 mx:slow.example.net -all"));
+        dns.put("slow.example.net", RecordType.MX,
+                new DnsResult(DnsStatus.TIMEOUT, List.of(), List.of()));
+        assertThat(evaluator.evaluate("h", "192.0.2.1", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.TEMPERROR);
+
+        // MX 正常但交换主机地址查询 MALFORMED：按既有映射不静默放行。
+        dns.put("example.com", RecordType.TXT, DnsStatus.OK,
+                List.of("v=spf1 mx:broken.example.net -all"));
+        dns.put("broken.example.net", RecordType.MX, DnsStatus.OK,
+                List.of(), List.of("x.broken.example.net"));
+        dns.put("x.broken.example.net", RecordType.A,
+                new DnsResult(DnsStatus.MALFORMED, List.of(), List.of()));
+        assertThat(evaluator.evaluate("h", "192.0.2.1", "a@example.com").getStatus())
+                .isEqualTo(SpfStatus.FAIL);
+    }
+
+    @Test
     void includeRecursionAndRedirect() {
         dns.put("example.com", RecordType.TXT, DnsStatus.OK,
                 List.of("v=spf1 include:partner.example.com -all"));
@@ -131,6 +229,30 @@ class SpfEvaluatorTest {
                 new DnsResult(DnsStatus.TIMEOUT, List.of(), List.of()));
         assertThat(evaluator.evaluate("h", "1.2.3.4", "a@bad.example.com").getStatus())
                 .isEqualTo(SpfStatus.TEMPERROR);
+    }
+
+    @Test
+    void slowTxtLookupIsCutOffByConfiguredTimeoutAndMapsTemperror() {
+        AuthProperties properties = new AuthProperties();
+        properties.getDns().setTimeoutMillis(50);
+        MapBackedDnsResolver slow = new MapBackedDnsResolver(new java.util.HashMap<>()) {
+            @Override
+            public DnsResult resolveAt(String domain, RecordType type, long version) {
+                try {
+                    Thread.sleep(30_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return new DnsResult(DnsStatus.TIMEOUT, List.of(), List.of());
+            }
+        };
+        SpfEvaluator slowEvaluator = new SpfEvaluator(
+                new CachingDnsResolver(slow, properties), properties);
+        long start = System.nanoTime();
+        assertThat(slowEvaluator.evaluate("h", "1.2.3.4", "a@slow.example.com").getStatus())
+                .isEqualTo(SpfStatus.TEMPERROR);
+        assertThat(java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+                System.nanoTime() - start)).isLessThan(2_000);
     }
 
     @Test
